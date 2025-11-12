@@ -12,12 +12,13 @@ from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -34,6 +35,8 @@ class PhotoBoothWindow(QMainWindow):
     CAPTURE_INTERVAL_MS = 5000
     MAX_CAPTURES = 8  # 8장 촬영
     SELECT_COUNT = 3  # 그 중 3장 선택
+    THUMBNAIL_WIDTH = 350  # 갤러리 썸네일 너비 (2열 그리드에 맞춤)
+    THUMBNAIL_HEIGHT = 200  # 갤러리 썸네일 최대 높이 (더 작게 설정)
 
     def __init__(self):
         super().__init__()
@@ -49,6 +52,10 @@ class PhotoBoothWindow(QMainWindow):
         self.output_dir = Path.cwd() / "captures"
         self.output_dir.mkdir(exist_ok=True)
         self.is_capture_countdown = False  # 촬영 사이 카운트다운 중인지
+        self.gallery_labels = []  # 갤러리 썸네일 레이블들
+        self.gallery_label_to_file = {}  # 레이블에서 파일 경로로 매핑
+        self.gallery_label_size = {}  # 레이블의 원본 크기 저장 (width, height)
+        self.selected_gallery_labels = []  # 선택된 갤러리 레이블들
 
         # Webcam setup
         self.capture = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
@@ -110,26 +117,86 @@ class PhotoBoothWindow(QMainWindow):
         # Gallery panel layout - 세로로 나누기
         gallery_splitter = QSplitter(Qt.Vertical, self)
         
-        # 상단: 전체 갤러리
+        # 상단: 전체 갤러리 (2x4 그리드)
         gallery_top = QWidget(self)
-        self.gallery_list = QListWidget(self)
-        self.gallery_list.setViewMode(QListWidget.IconMode)
-        self.gallery_list.setIconSize(QSize(160, 120))
-        self.gallery_list.setResizeMode(QListWidget.Adjust)
-        self.gallery_list.setMovement(QListWidget.Static)
-        self.gallery_list.setSelectionMode(QListWidget.MultiSelection)  # 다중 선택 활성화
-        self.gallery_list.itemSelectionChanged.connect(self.on_selection_changed)
-        # 파일명 텍스트 숨기기 스타일
-        self.gallery_list.setStyleSheet(
-            "QListWidget::item { "
-            "height: 140px; "
-            "padding: 5px; "
-            "}"
-            "QListWidget::item::text { "
-            "color: transparent; "
-            "height: 0px; "
-            "}"
-        )
+        
+        # 스크롤 영역 생성
+        self.gallery_scroll = QScrollArea(self)
+        self.gallery_scroll.setWidgetResizable(True)  # 그리드 위젯이 자동으로 크기 조정
+        self.gallery_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.gallery_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.gallery_scroll.setStyleSheet("QScrollArea { border: none; }")
+        
+        # 그리드 컨테이너 위젯
+        self.gallery_grid_widget = QWidget(self)
+        self.gallery_grid = QGridLayout(self.gallery_grid_widget)
+        self.gallery_grid.setContentsMargins(10, 10, 10, 10)  
+        self.gallery_grid.setSpacing(10)  # 아이템 간격 없음
+        # 2열 균등 분배 (정확히 50:50)
+        self.gallery_grid.setColumnStretch(0, 1)
+        self.gallery_grid.setColumnStretch(1, 1)
+        self.gallery_grid.setColumnMinimumWidth(0, 0)
+        self.gallery_grid.setColumnMinimumWidth(1, 0)
+        # 4행 설정 (초기 최소 높이 설정)
+        INITIAL_MIN_HEIGHT = 100 # 초기값, 동적으로 덮어씌워질 예정
+        for i in range(4):
+            self.gallery_grid.setRowMinimumHeight(i, INITIAL_MIN_HEIGHT)
+            self.gallery_grid.setRowStretch(i, 0)  # 고정 높이이므로 stretch 제거
+        
+        # 그리드 위젯 크기 정책 설정
+        # 너비는 스크롤 영역에 맞춰지고, 높이는 고정 (4행 × THUMBNAIL_HEIGHT)
+        self.gallery_grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 그리드 위젯의 최소/최대 높이 설정 (INITIAL_MIN_HEIGHT 사용)
+        grid_height = 4 * INITIAL_MIN_HEIGHT
+        self.gallery_grid_widget.setMinimumHeight(grid_height)
+        self.gallery_grid_widget.setMaximumHeight(grid_height)
+        
+        self.gallery_scroll.setWidget(self.gallery_grid_widget)
+        
+        # 그리드 위젯 너비를 viewport 너비에 맞추는 함수 (높이 동적 계산 추가)
+        def update_grid_width():
+            if hasattr(self, 'gallery_scroll') and hasattr(self, 'gallery_grid_widget'):
+                viewport_width = self.gallery_scroll.viewport().width()
+                if viewport_width > 0:
+
+                    # 1. 여백 및 마진 값 가져오기
+                    grid_spacing = self.gallery_grid.spacing() # 10px
+                    # 좌우 마진 합계
+                    grid_margin = (self.gallery_grid.contentsMargins().left() + 
+                                   self.gallery_grid.contentsMargins().right())
+
+                    # 2. 썸네일 너비 계산 (뷰포트 너비의 절반)
+                    # 유효 너비 = 뷰포트 너비 - 좌우 마진 - 2개 열 사이 간격 1개
+                    effective_content_width = viewport_width - grid_margin - grid_spacing
+                    thumbnail_width = effective_content_width / 2
+
+                    # 3. 썸네일 높이 계산 (최종 사진 비율 3:4 적용)
+                    THUMBNAIL_ASPECT_RATIO = 3 / 4
+                    new_thumbnail_height = int(thumbnail_width * THUMBNAIL_ASPECT_RATIO)
+
+                    # 4. 갤러리 그리드 행 높이 업데이트
+                    for i in range(4):
+                        self.gallery_grid.setRowMinimumHeight(i, new_thumbnail_height)
+                    
+                    # 5. 갤러리 위젯의 고정 높이 업데이트 (4행 기준)
+                    # 높이 = (4행 * 높이) + (3개 행 사이 간격) + (상하 마진)
+                    grid_height = 4 * new_thumbnail_height + (3 * grid_spacing)+ (self.gallery_grid.contentsMargins().top() + self.gallery_grid.contentsMargins().bottom())
+                    self.gallery_grid_widget.setMinimumHeight(grid_height)
+                    self.gallery_grid_widget.setMaximumHeight(grid_height)
+
+                    # 6. 그리드 위젯의 최대 너비를 설정
+                    self.gallery_grid_widget.setMaximumWidth(viewport_width)
+                    self.gallery_grid_widget.updateGeometry()
+                    
+                    # 7. 갤러리 내 썸네일 위젯 크기 업데이트
+                    if hasattr(self, 'update_thumbnails_size'):
+                        self.update_thumbnails_size(new_thumbnail_height, int(thumbnail_width))
+
+        # 그리드 너비 업데이트 함수 저장 (resizeEvent에서 사용)
+        self._update_grid_width_func = update_grid_width
+        
+        # 초기 크기 설정 (창이 표시된 후)
+        QTimer.singleShot(100, update_grid_width)
 
         # 선택 상태 표시 레이블
         self.selection_label = QLabel("Select photos (0/3)", self)
@@ -137,8 +204,9 @@ class PhotoBoothWindow(QMainWindow):
         self.selection_label.setStyleSheet("font-size: 16px; padding: 8px;")
 
         gallery_top_layout = QVBoxLayout(gallery_top)
+        gallery_top_layout.setContentsMargins(5, 5, 5, 5)
         gallery_top_layout.addWidget(QLabel("Captured Photos (Select 3 of 8)", self))
-        gallery_top_layout.addWidget(self.gallery_list, stretch=1)
+        gallery_top_layout.addWidget(self.gallery_scroll, stretch=1)
         gallery_top_layout.addWidget(self.selection_label)
 
         # 하단: 선택된 3장 미리보기
@@ -248,7 +316,16 @@ class PhotoBoothWindow(QMainWindow):
         # 재시작 시 상태 초기화
         self.captured_frames = []
         self.selected_frames = []
-        self.gallery_list.clear()
+        self.selected_gallery_labels = []
+        
+        # 갤러리 그리드 초기화
+        for label in self.gallery_labels:
+            self.gallery_grid.removeWidget(label)
+            label.deleteLater()
+        self.gallery_labels.clear()
+        self.gallery_label_to_file.clear()
+        self.gallery_label_size.clear()  # 크기 정보도 초기화
+        
         self.finalize_button.setEnabled(False)
         self.finalize_button.setText("Complete Selection (0/3 Photos)")
         self.finalize_button.setStyleSheet(
@@ -391,20 +468,119 @@ class PhotoBoothWindow(QMainWindow):
             # QImage가 데이터를 소유하도록 복사본 생성 (메모리 안전성)
             thumb_image = thumb_image.copy()
             
+            # 그리드 위치 계산 (2열, 4행)
+            index = len(self.captured_frames) - 1  # 0부터 시작
+            row = index // 2  # 행 (0, 1, 2, 3)
+            col = index % 2   # 열 (0, 1)
+            
+            # 썸네일 레이블 생성
+            thumb_label = QLabel(self.gallery_grid_widget)  # 부모를 그리드 위젯으로 설정
+            thumb_label.setAlignment(Qt.AlignCenter)
+            # 이미지가 레이블 크기에 맞춰 확장 (그리드 셀을 완전히 채움)
+            thumb_label.setScaledContents(True)
+            # 크기 정책을 Fixed로 설정 (크기 변경 완전 방지)
+            thumb_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            # 4:3 비율로 크기 계산 (높이 기준)
+            thumb_height = self.THUMBNAIL_HEIGHT
+            thumb_width = int(thumb_height * 4 / 3)  # 4:3 비율
+            
+            # viewport 너비 제한 확인 (2열이므로 각 썸네일은 viewport 너비의 절반을 넘지 않아야 함)
+            viewport_width = self.gallery_scroll.viewport().width() if hasattr(self, 'gallery_scroll') else 400
+            if viewport_width <= 0:
+                viewport_width = self.gallery_scroll.width() if hasattr(self, 'gallery_scroll') else 400
+                if viewport_width <= 0:
+                    viewport_width = 400
+            
+            max_width = viewport_width // 2
+            # 계산된 너비가 최대 너비를 초과하면 높이를 조정
+            if thumb_width > max_width:
+                thumb_width = max_width
+                thumb_height = int(thumb_width * 3 / 4)  # 4:3 비율 유지 (너비 기준)
+            
+            thumb_label.setFixedSize(thumb_width, thumb_height)  # 4:3 비율 고정 크기
+            # 레이블의 원본 크기 저장 (선택 시 크기 변경 방지)
+            self.gallery_label_size[thumb_label] = (thumb_width, thumb_height)
+            thumb_label.setStyleSheet(
+                "QLabel { "
+                "border: 2px solid transparent; "
+                "background-color: #f0f0f0; "
+                "width: " + str(thumb_width) + "px; "
+                "height: " + str(thumb_height) + "px; "
+                "min-width: " + str(thumb_width) + "px; "
+                "max-width: " + str(thumb_width) + "px; "
+                "min-height: " + str(thumb_height) + "px; "
+                "max-height: " + str(thumb_height) + "px; "
+                "}"
+                "QLabel:hover { "
+                "border: 3px solid #2196F3; "
+                "}"
+            )
+            thumb_label.setCursor(Qt.PointingHandCursor)  # 클릭 가능 커서
+            
+            # 레이블 클릭 이벤트 연결 (클로저 문제 방지를 위해 기본 인자 사용)
+            def make_click_handler(label):
+                return lambda event: self.on_gallery_label_clicked(label)
+            thumb_label.mousePressEvent = make_click_handler(thumb_label)
+            
+            # 파일 경로 매핑 저장
+            self.gallery_label_to_file[thumb_label] = filename
+            
+            # 썸네일 생성 - 그리드 셀 크기에 맞게 스케일링
+            # viewport 너비의 절반과 THUMBNAIL_HEIGHT를 기준으로 크기 계산
+            if hasattr(self, 'gallery_scroll'):
+                viewport_width = self.gallery_scroll.viewport().width()
+                if viewport_width <= 0:
+                    # viewport 너비가 0이면 스크롤 영역 너비 사용
+                    viewport_width = self.gallery_scroll.width()
+                    if viewport_width <= 0:
+                        viewport_width = 400  # 기본값
+            else:
+                viewport_width = 400  # 기본값
+            
+            thumb_target_width = max(viewport_width // 2, 200)  # 최소 200px
+            thumb_target_height = self.THUMBNAIL_HEIGHT
+            
+            # 원본 이미지 크기
+            orig_height, orig_width = thumb_image.height(), thumb_image.width()
+            
+            # 비율 유지하면서 타겟 크기에 맞게 스케일링
+            # 높이 기준으로 스케일링 (높이가 제한이므로)
+            scale_height = thumb_target_height / orig_height
+            scale_width = thumb_target_width / orig_width
+            scale = min(scale_height, scale_width, 1.0)  # 확대하지 않고 축소만
+            
+            new_width = int(orig_width * scale)
+            new_height = int(orig_height * scale)
+            
+            # 썸네일 생성
             thumb_pixmap = QPixmap.fromImage(thumb_image).scaled(
-                self.gallery_list.iconSize(),
+                new_width, new_height,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
             
-            # QPixmap을 QIcon으로 변환
-            thumb_icon = QIcon(thumb_pixmap)
-
-            item = QListWidgetItem()
-            item.setText("")  # 파일명 숨기기
-            item.setData(Qt.UserRole, str(filename))
-            item.setIcon(thumb_icon)
-            self.gallery_list.addItem(item)
+            if thumb_pixmap.isNull():
+                print(f"Warning: Failed to create pixmap for {filename}")
+                return
+            
+            # 썸네일을 레이블에 설정
+            thumb_label.setPixmap(thumb_pixmap)
+            
+            # 그리드에 추가 (2열, 4행)
+            self.gallery_grid.addWidget(thumb_label, row, col)
+            self.gallery_labels.append(thumb_label)
+            
+            # 레이블이 보이도록 설정
+            thumb_label.show()
+            
+            # 그리드 레이아웃 업데이트
+            self.gallery_grid_widget.updateGeometry()
+            
+            # 디버깅: 아이템이 추가되었는지 확인
+            print(f"Added item to gallery: {filename.name}, position: row={row}, col={col}, total items: {len(self.gallery_labels)}")
+            if len(self.gallery_labels) == 1:
+                # 첫 번째 썸네일 추가 시 그리드 너비 확인
+                QTimer.singleShot(200, lambda: print(f"Grid widget size: {self.gallery_grid_widget.width()}x{self.gallery_grid_widget.height()}, Scroll viewport: {self.gallery_scroll.viewport().width()}"))
 
             if auto:
                 remaining = self.MAX_CAPTURES - len(self.captured_frames)
@@ -421,29 +597,146 @@ class PhotoBoothWindow(QMainWindow):
             self.status_label.setText(error_msg)
             print(f"Capture error: {e}")  # 디버깅용
 
+    
+    def update_thumbnails_size(self, new_height, new_width):
+        """
+        갤러리 그리드 내의 모든 썸네일 위젯의 높이와 너비를 조정하고 이미지를 리스케일링합니다.
+        """
+        
+        # 예시: QGridLayout을 순회하며 위젯 크기 조정
+        for i in range(self.gallery_grid.count()):
+            item = self.gallery_grid.itemAt(i)
+            if item and item.widget():
+                thumbnail_widget = item.widget() # 썸네일 위젯 (QLabel 등으로 가정)
+                
+                # 1. 썸네일 위젯의 높이를 설정합니다.
+                thumbnail_widget.setFixedHeight(new_width,new_height) 
+                
+                # 2. 썸네일 위젯에 표시되는 이미지를 새 크기에 맞게 다시 스케일링합니다.
+                # 이 로직은 썸네일 위젯이 원본 QPixmap을 저장하고 있을 때 작동합니다.
+                if hasattr(thumbnail_widget, 'original_pixmap') and thumbnail_widget.original_pixmap is not None:
+                    scaled_pixmap = thumbnail_widget.original_pixmap.scaled(
+                        new_width,new_height, 
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    thumbnail_widget.setPixmap(scaled_pixmap)
+                
+                thumbnail_widget.update() # 위젯 강제 업데이트
     # ---- Selection handlers -------------------------------------------------------
 
-    def on_selection_changed(self):
-        """갤러리에서 선택이 변경될 때 호출되는 핸들러."""
-        selected_items = self.gallery_list.selectedItems()
-        selected_count = len(selected_items)
+    def on_gallery_label_clicked(self, label):
+        """갤러리 레이블 클릭 시 호출되는 핸들러."""
+        # 레이블에서 파일 경로 가져오기
+        if label not in self.gallery_label_to_file:
+            return
         
-        # 최대 3장까지만 선택 가능
-        if selected_count > self.SELECT_COUNT:
-            # 3장 초과 선택 시 가장 오래된 선택 해제
-            for item in selected_items[:-self.SELECT_COUNT]:
-                item.setSelected(False)
-            selected_count = self.SELECT_COUNT
-            selected_items = self.gallery_list.selectedItems()
+        # 이미 선택된 레이블인지 확인
+        if label in self.selected_gallery_labels:
+            # 선택 해제 - 스타일만 변경, 크기는 변경하지 않음
+            self.selected_gallery_labels.remove(label)
+            # 저장된 원본 크기 사용 (크기 변경 방지)
+            if label in self.gallery_label_size:
+                original_width, original_height = self.gallery_label_size[label]
+            else:
+                # 저장된 크기가 없으면 현재 크기 사용
+                original_width = label.width()
+                original_height = label.height()
+                self.gallery_label_size[label] = (original_width, original_height)
+            # 크기를 강제로 고정 (크기 변경 완전 방지)
+            label.setFixedSize(original_width, original_height)
+            # 크기 정책은 이미 Fixed로 설정되어 있으므로 변경하지 않음
+            # 스타일만 변경하되 크기 속성도 포함 (크기 변경 방지)
+            label.setStyleSheet(
+                "QLabel { "
+                "border: 2px solid transparent; "
+                "background-color: #f0f0f0; "
+                "width: " + str(original_width) + "px; "
+                "height: " + str(original_height) + "px; "
+                "min-width: " + str(original_width) + "px; "
+                "max-width: " + str(original_width) + "px; "
+                "min-height: " + str(original_height) + "px; "
+                "max-height: " + str(original_height) + "px; "
+                "}"
+                "QLabel:hover { "
+                "border: 3px solid #2196F3; "
+                "}"
+            )
+        else:
+            # 선택 추가 (최대 3장까지만)
+            if len(self.selected_gallery_labels) >= self.SELECT_COUNT:
+                # 가장 오래된 선택 해제 - 스타일만 변경, 크기는 변경하지 않음
+                oldest_label = self.selected_gallery_labels.pop(0)
+                # 저장된 원본 크기 사용 (크기 변경 방지)
+                if oldest_label in self.gallery_label_size:
+                    old_width, old_height = self.gallery_label_size[oldest_label]
+                else:
+                    # 저장된 크기가 없으면 현재 크기 사용
+                    old_width = oldest_label.width()
+                    old_height = oldest_label.height()
+                    self.gallery_label_size[oldest_label] = (old_width, old_height)
+                # 크기를 강제로 고정 (크기 변경 완전 방지)
+                oldest_label.setFixedSize(old_width, old_height)
+                # 크기 정책은 이미 Fixed로 설정되어 있으므로 변경하지 않음
+                # 스타일만 변경하되 크기 속성도 포함 (크기 변경 방지)
+                oldest_label.setStyleSheet(
+                    "QLabel { "
+                    "border: 2px solid transparent; "
+                    "background-color: #f0f0f0; "
+                    "width: " + str(old_width) + "px; "
+                    "height: " + str(old_height) + "px; "
+                    "min-width: " + str(old_width) + "px; "
+                    "max-width: " + str(old_width) + "px; "
+                    "min-height: " + str(old_height) + "px; "
+                    "max-height: " + str(old_height) + "px; "
+                    "}"
+                    "QLabel:hover { "
+                    "border: 3px solid #2196F3; "
+                    "}"
+                )
+            
+            # 새 레이블 선택 - 스타일만 변경, 크기는 변경하지 않음
+            self.selected_gallery_labels.append(label)
+            # 저장된 원본 크기 사용 (크기 변경 방지)
+            if label in self.gallery_label_size:
+                original_width, original_height = self.gallery_label_size[label]
+            else:
+                # 저장된 크기가 없으면 현재 크기 사용
+                original_width = label.width()
+                original_height = label.height()
+                self.gallery_label_size[label] = (original_width, original_height)
+            # 크기를 강제로 고정 (크기 변경 완전 방지)
+            label.setFixedSize(original_width, original_height)
+            # 크기 정책은 이미 Fixed로 설정되어 있으므로 변경하지 않음
+            # 스타일만 변경하되 크기 속성도 포함 (크기 변경 방지)
+            # 선택 시 테두리 색깔만 변경 (border 크기는 2px로 유지하여 크기 변경 방지)
+            # 모든 상태에서 테두리 색상이 명확하게 변경되도록 설정
+            label.setStyleSheet(
+                "QLabel { "
+                "border: 2px solid #4CAF50; "
+                "background-color: rgba(76, 175, 80, 0.1); "
+                "width: " + str(original_width) + "px; "
+                "height: " + str(original_height) + "px; "
+                "min-width: " + str(original_width) + "px; "
+                "max-width: " + str(original_width) + "px; "
+                "min-height: " + str(original_height) + "px; "
+                "max-height: " + str(original_height) + "px; "
+                "}"
+                "QLabel:hover { "
+                "border: 2px solid #66BB6A; "
+                "background-color: rgba(76, 175, 80, 0.25); "
+                "}"
+            )
         
-        # 선택된 파일 경로 저장
-        self.selected_frames = [Path(item.data(Qt.UserRole)) for item in selected_items]
+        # 선택된 파일 경로 업데이트
+        self.selected_frames = [self.gallery_label_to_file[label] for label in self.selected_gallery_labels]
+        selected_count = len(self.selected_gallery_labels)
         
         # 선택 상태 업데이트
         self.selection_label.setText(f"Selected: {selected_count}/{self.SELECT_COUNT}")
         
         # 선택된 사진을 미리보기 영역에 표시
-        for i, label in enumerate(self.selected_preview_labels):
+        for i, preview_label in enumerate(self.selected_preview_labels):
             if i < selected_count:
                 # 선택된 사진 로드 및 표시
                 img_path = self.selected_frames[i]
@@ -453,24 +746,24 @@ class PhotoBoothWindow(QMainWindow):
                         if not pixmap.isNull():
                             # 레이블 크기에 맞춰 스케일링
                             scaled = pixmap.scaled(
-                                label.width(),
-                                label.height(),
+                                preview_label.width(),
+                                preview_label.height(),
                                 Qt.KeepAspectRatio,
                                 Qt.SmoothTransformation,
                             )
-                            label.setPixmap(scaled)
-                            label.setText("")
+                            preview_label.setPixmap(scaled)
+                            preview_label.setText("")
                         else:
-                            label.setText(f"Photo {i+1}\n(Invalid image)")
+                            preview_label.setText(f"Photo {i+1}\n(Invalid image)")
                     except Exception as e:
-                        label.setText(f"Photo {i+1}\n(Error)")
+                        preview_label.setText(f"Photo {i+1}\n(Error)")
                         print(f"미리보기 로드 오류: {e}")
                 else:
-                    label.setText(f"Photo {i+1}\n(Not found)")
+                    preview_label.setText(f"Photo {i+1}\n(Not found)")
             else:
                 # 빈 슬롯
-                label.clear()
-                label.setText(f"Photo {i+1}")
+                preview_label.clear()
+                preview_label.setText(f"Photo {i+1}")
         
         # 3장이 선택되면 완료 버튼 활성화
         if selected_count == self.SELECT_COUNT:
@@ -516,6 +809,14 @@ class PhotoBoothWindow(QMainWindow):
         self.status_label.setText("Final selection complete!")
 
     # ---- Qt lifecycle -------------------------------------------------------------
+
+    def resizeEvent(self, event):
+        """창 크기가 변경될 때 호출됩니다."""
+        super().resizeEvent(event)
+        # 그리드 너비 업데이트 (창 크기 변경 시)
+        if hasattr(self, '_update_grid_width_func'):
+            # 약간의 지연을 두어 레이아웃이 완전히 업데이트된 후 실행
+            QTimer.singleShot(50, self._update_grid_width_func)
 
     def closeEvent(self, event):
         if self.timer_stream.isActive():
